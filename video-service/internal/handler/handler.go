@@ -2,6 +2,8 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -32,6 +34,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("PATCH /videos/{id}", h.update)
 	mux.HandleFunc("DELETE /videos/{id}", h.delete)
 	mux.HandleFunc("GET /videos/{id}/stream", h.stream)
+	mux.HandleFunc("POST /videos/{id}/view", h.view)
 	mux.HandleFunc("GET /videos/{id}/thumbnail", h.thumbnail)
 	mux.HandleFunc("PUT /videos/{id}/thumbnail", h.setThumbnail)
 	mux.HandleFunc("GET /videos/{id}/recommendations", h.recommendations)
@@ -291,10 +294,6 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	if isFirstChunk(r) {
-		h.svc.RegisterView(r.Context(), id)
-	}
-
 	// Видеофайл после загрузки не меняется — браузер может держать его в кеше
 	// и при повторном просмотре не скачивать заново.
 	w.Header().Set("Cache-Control", "public, max-age=86400")
@@ -302,11 +301,30 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, video.FileName, video.CreatedAt, file)
 }
 
-// isFirstChunk — просмотр засчитываем только при запросе начала файла,
-// а не на каждый Range-запрос при перемотке.
-func isFirstChunk(r *http.Request) bool {
-	rng := r.Header.Get("Range")
-	return rng == "" || strings.HasPrefix(rng, "bytes=0-")
+// view засчитывает просмотр. Фронтенд вызывает его, когда зритель посмотрел первые секунды.
+// Каждый зритель учитывается один раз: вошедший — по ID пользователя,
+// гость — по хешу IP-адреса и браузера (User-Agent).
+func (h *Handler) view(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := h.svc.RegisterView(r.Context(), id, viewerKey(r))
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, res)
+}
+
+func viewerKey(r *http.Request) string {
+	if userID, ok := httpx.UserID(r); ok {
+		return "u:" + strconv.FormatInt(userID, 10)
+	}
+	// X-Real-IP выставляет gateway (значение от клиента он отбрасывает).
+	sum := sha256.Sum256([]byte(r.Header.Get("X-Real-IP") + "|" + r.Header.Get("User-Agent")))
+	return "a:" + hex.EncodeToString(sum[:16])
 }
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {

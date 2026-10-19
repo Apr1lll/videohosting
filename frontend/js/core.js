@@ -203,9 +203,15 @@ export function thumb(v) {
       <span class="frame-title">${esc(v.title)}</span>${duration}</div>`;
 }
 
+// Запасная картинка (силуэт), если аватарку не удалось загрузить.
+const AVATAR_FALLBACK = "data:image/svg+xml," + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" fill="#5B6577"/>' +
+  '<circle cx="32" cy="25" r="11" fill="#E9EDF2"/><path d="M12 56c3-11 11-16 20-16s17 5 20 16z" fill="#E9EDF2"/></svg>');
+const onAvatarError = `onerror="this.onerror=null;this.src='${AVATAR_FALLBACK}'"`;
+
 export function avatar(userId, size = 36, version = "") {
   const v = version ? `?v=${encodeURIComponent(version)}` : "";
-  return `<img class="avatar" src="/users/${userId}/avatar${v}" width="${size}" height="${size}" alt="" loading="lazy">`;
+  return `<img class="avatar" src="/users/${userId}/avatar${v}" width="${size}" height="${size}" alt="" ${onAvatarError}>`;
 }
 
 // Для своего аватара добавляем версию, чтобы после смены картинки не показывался старый кеш.
@@ -213,7 +219,7 @@ export function myAvatar(size = 32) {
   const me = session.user;
   if (!me) return "";
   const url = me.avatar_url || `/users/${me.id}/avatar`;
-  return `<img class="avatar" src="${esc(url)}" width="${size}" height="${size}" alt="">`;
+  return `<img class="avatar" src="${esc(url)}" width="${size}" height="${size}" alt="" ${onAvatarError}>`;
 }
 
 export function videoCard(v) {

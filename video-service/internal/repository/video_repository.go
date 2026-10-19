@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"videohosting/video-service/internal/model"
@@ -145,6 +146,22 @@ func (r *VideoRepository) Delete(ctx context.Context, id int64) error {
 // DeleteByAuthor удаляет все видео пользователя и возвращает их, чтобы удалить файлы.
 func (r *VideoRepository) DeleteByAuthor(ctx context.Context, authorID int64) ([]model.Video, error) {
 	return r.queryVideos(ctx, `DELETE FROM videos WHERE author_id = $1 RETURNING `+videoColumns, authorID)
+}
+
+// RecordView запоминает, что зритель посмотрел видео. Возвращает true, если это первый
+// просмотр этого зрителя: повторная вставка упирается в первичный ключ и ничего не делает.
+func (r *VideoRepository) RecordView(ctx context.Context, videoID int64, viewerKey string) (bool, error) {
+	tag, err := r.db.Exec(ctx,
+		`INSERT INTO video_views (video_id, viewer_key) VALUES ($1, $2)
+		 ON CONFLICT (video_id, viewer_key) DO NOTHING`, videoID, viewerKey)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" { // нарушение внешнего ключа — видео нет
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // AddViews прибавляет накопленные в Redis просмотры к счётчику в БД.

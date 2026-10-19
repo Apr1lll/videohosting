@@ -43,6 +43,7 @@ type Repository interface {
 	Unsubscribe(ctx context.Context, subscriberID, channelID int64) error
 	ListSubscriptions(ctx context.Context, subscriberID int64) ([]model.Subscription, error)
 	ListSubscribers(ctx context.Context, channelID int64) ([]model.Subscriber, error)
+	SetSubscriberName(ctx context.Context, subscriberID int64, name string) error
 	CountSubscribers(ctx context.Context, channelID int64) (int64, error)
 	DeleteVideoData(ctx context.Context, videoID int64) error
 	DeleteUserData(ctx context.Context, userID int64) ([]int64, error)
@@ -273,8 +274,28 @@ func (s *Service) Subscriptions(ctx context.Context, userID int64) ([]model.Subs
 	return s.repo.ListSubscriptions(ctx, userID)
 }
 
+// Subscribers — список подписчиков канала. Подписки, оформленные до появления колонки
+// subscriber_name, хранят пустое имя: его спрашиваем у auth-service и сохраняем,
+// чтобы в следующий раз не ходить за ним снова.
 func (s *Service) Subscribers(ctx context.Context, channelID int64) ([]model.Subscriber, error) {
-	return s.repo.ListSubscribers(ctx, channelID)
+	subs, err := s.repo.ListSubscribers(ctx, channelID)
+	if err != nil {
+		return nil, err
+	}
+	for i := range subs {
+		if subs[i].Username != "" {
+			continue
+		}
+		name, found, err := s.users.GetUsername(ctx, subs[i].UserID)
+		if err != nil || !found {
+			continue
+		}
+		subs[i].Username = name
+		if err := s.repo.SetSubscriberName(ctx, subs[i].UserID, name); err != nil {
+			slog.Warn("failed to save subscriber name", "user_id", subs[i].UserID, "err", err)
+		}
+	}
+	return subs, nil
 }
 
 func (s *Service) SubscribersCount(ctx context.Context, channelID int64) (int64, error) {

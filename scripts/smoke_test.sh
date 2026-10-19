@@ -64,6 +64,17 @@ check "стриминг целиком" 200 "$code"
 cmp -s "$TMP/test.mp4" "$TMP/out.mp4" && check "файл совпадает с загруженным" ok ok
 code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Range: bytes=1000-1999' "$API/videos/$VIDEO_ID/stream")
 check "Range-запрос (перемотка)" 206 "$code"
+echo "== Уникальные просмотры"
+c1=$(curl -s -X POST "$API/videos/$VIDEO_ID/view" -H "Authorization: Bearer $BOB_TOKEN" | json_field counted)
+c2=$(curl -s -X POST "$API/videos/$VIDEO_ID/view" -H "Authorization: Bearer $BOB_TOKEN" | json_field counted)
+check "первый просмотр засчитан" true "$c1"
+check "повторный просмотр того же зрителя не засчитан" false "$c2"
+c3=$(curl -s -X POST "$API/videos/$VIDEO_ID/view" -A "smoke-guest-$SUFFIX" | json_field counted)
+c4=$(curl -s -X POST "$API/videos/$VIDEO_ID/view" -A "smoke-guest-$SUFFIX" | json_field counted)
+check "гость засчитан один раз" "true false" "$c3 $c4"
+for i in 1 2 3; do curl -s -o /dev/null "$API/videos/$VIDEO_ID/stream"; done
+views=$(curl -s "$API/videos/$VIDEO_ID" | json_field views)
+check "открытие видео не накручивает просмотры" 2 "$views"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$API/videos/popular")
 check "популярные видео" 200 "$code"
 

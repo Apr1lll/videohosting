@@ -57,6 +57,7 @@ type VideoRepository interface {
 	Delete(ctx context.Context, id int64) error
 	DeleteByAuthor(ctx context.Context, authorID int64) ([]model.Video, error)
 	AddViews(ctx context.Context, id, delta int64) error
+	RecordView(ctx context.Context, videoID int64, viewerKey string) (bool, error)
 	Stats(ctx context.Context) (*model.Stats, error)
 }
 
@@ -447,10 +448,33 @@ func (s *VideoService) OpenStream(ctx context.Context, id int64) (*model.Video, 
 	return video, f, nil
 }
 
-func (s *VideoService) RegisterView(ctx context.Context, id int64) {
-	if err := s.cache.IncrView(ctx, id); err != nil {
-		slog.Warn("failed to register view", "video_id", id, "err", err)
+// ViewResult — ответ на регистрацию просмотра.
+type ViewResult struct {
+	Counted bool  `json:"counted"` // false — этот зритель уже смотрел видео
+	Views   int64 `json:"views"`
+}
+
+// RegisterView засчитывает просмотр, только если этот зритель смотрит видео впервые.
+// Факт просмотра хранится в Postgres (уникальность), а сам счётчик копится в Redis
+// и пачкой переносится в БД — как и раньше.
+func (s *VideoService) RegisterView(ctx context.Context, id int64, viewerKey string) (*ViewResult, error) {
+	counted, err := s.repo.RecordView(ctx, id, viewerKey)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, ErrNotFound
 	}
+	if err != nil {
+		return nil, err
+	}
+	if counted {
+		if err := s.cache.IncrView(ctx, id); err != nil {
+			slog.Warn("failed to register view", "video_id", id, "err", err)
+		}
+	}
+	video, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	return &ViewResult{Counted: counted, Views: video.Views}, nil
 }
 
 // RunViewsFlusher периодически переносит просмотры из Redis в Postgres.

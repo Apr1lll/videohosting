@@ -3,7 +3,8 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /bin/app ./cmd/server
+# -p 1: компилировать по одному пакету — меньше памяти (важно для VPS с 1–2 ГБ без swap)
+RUN CGO_ENABLED=0 go build -p 1 -ldflags="-s -w" -o /bin/app ./cmd/server
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates

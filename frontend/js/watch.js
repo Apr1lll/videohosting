@@ -77,6 +77,7 @@ export async function videoPage(app, id, isCurrent) {
   });
 
   renderDescription(video);
+  trackView(video, player.video);
   setupReactions(video, isCurrent);
   setupSubscription(video, isCurrent);
   setupComments(video, isCurrent);
@@ -99,6 +100,28 @@ export async function videoPage(app, id, isCurrent) {
       } catch (e) { toast(e.message); }
     };
   }
+}
+
+// Просмотр засчитывается, когда зритель реально посмотрел первые секунды (3 с или половину
+// короткого ролика). Сервер учитывает каждого зрителя один раз, поэтому
+// повторные открытия и перезагрузки страницы счётчик не накручивают.
+function trackView(video, el) {
+  let sent = false;
+  const onTime = () => {
+    const need = Math.min(3, (el.duration || 6) / 2);
+    if (sent || el.currentTime < need) return;
+    sent = true;
+    el.removeEventListener("timeupdate", onTime);
+    api(`/videos/${video.id}/view`, { method: "POST" })
+      .then((res) => {
+        if (res.counted && document.getElementById("description")) {
+          video.views = res.views;
+          renderDescription(video);
+        }
+      })
+      .catch(() => {});
+  };
+  el.addEventListener("timeupdate", onTime);
 }
 
 function renderDescription(video) {

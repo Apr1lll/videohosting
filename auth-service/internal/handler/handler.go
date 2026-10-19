@@ -193,7 +193,10 @@ func (h *Handler) avatar(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("v") != "" {
 		w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
 	} else {
-		w.Header().Set("Cache-Control", "public, max-age=300")
+		// Без версии браузер каждый раз сверяется с сервером (ответ 304 — почти бесплатно),
+		// поэтому новая аватарка сразу видна под видео и в комментариях.
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Last-Modified", user.UpdatedAt.UTC().Format(http.TimeFormat))
 	}
 
 	if file == nil {

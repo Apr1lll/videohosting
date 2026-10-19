@@ -227,6 +227,14 @@ func (r *Repository) ListSubscribers(ctx context.Context, channelID int64) ([]mo
 	return subs, rows.Err()
 }
 
+// SetSubscriberName дописывает имя подписчика в старые записи, где его не было.
+func (r *Repository) SetSubscriberName(ctx context.Context, subscriberID int64, name string) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE subscriptions SET subscriber_name = $2 WHERE subscriber_id = $1 AND subscriber_name = ''`,
+		subscriberID, name)
+	return err
+}
+
 func (r *Repository) CountSubscribers(ctx context.Context, channelID int64) (int64, error) {
 	var n int64
 	err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM subscriptions WHERE channel_id = $1`, channelID).Scan(&n)

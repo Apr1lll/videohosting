@@ -97,6 +97,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Header.Del("X-User-ID")
 	r.Header.Del("X-Username")
 	r.Header.Del("X-User-Role")
+	// Настоящий IP клиента для сервисов (например, для подсчёта уникальных просмотров гостей).
+	// Присланный клиентом X-Real-IP заменяем — подделать его нельзя.
+	r.Header.Set("X-Real-IP", clientIP(r))
 
 	isAdmin := false
 	if header := r.Header.Get("Authorization"); header != "" {
