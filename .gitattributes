@@ -1,0 +1,2 @@
+# Всегда LF-переводы строк: иначе на Windows скрипты и Dockerfile ломаются на сервере.
+* text=auto eol=lf
