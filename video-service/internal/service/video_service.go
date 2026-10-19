@@ -2,15 +2,18 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"videohosting/video-service/internal/model"
@@ -19,7 +22,7 @@ import (
 
 var (
 	ErrNotFound  = errors.New("video not found")
-	ErrForbidden = errors.New("you can delete only your own videos")
+	ErrForbidden = errors.New("you can change only your own videos")
 )
 
 type ValidationError struct {
@@ -36,7 +39,10 @@ var allowedFormats = map[string]string{
 	".mkv":  "video/x-matroska",
 }
 
-const popularLimit = 10
+const (
+	popularLimit      = 10
+	maxThumbnailBytes = 5 << 20 // 5 МБ
+)
 
 // Интерфейсы зависимостей: сервис не знает о конкретных Postgres/Redis,
 // что упрощает тестирование и замену реализаций.
@@ -45,8 +51,13 @@ type VideoRepository interface {
 	GetByID(ctx context.Context, id int64) (*model.Video, error)
 	List(ctx context.Context, f model.ListFilter) ([]model.Video, int, error)
 	Popular(ctx context.Context, limit int) ([]model.Video, error)
+	Recommendations(ctx context.Context, videoID, authorID int64, tsQuery string, limit int) ([]model.Video, error)
+	UpdateInfo(ctx context.Context, id int64, title, description string) (*model.Video, error)
+	SetThumbnail(ctx context.Context, id int64, file string) (*model.Video, error)
 	Delete(ctx context.Context, id int64) error
+	DeleteByAuthor(ctx context.Context, authorID int64) ([]model.Video, error)
 	AddViews(ctx context.Context, id, delta int64) error
+	Stats(ctx context.Context) (*model.Stats, error)
 }
 
 type Cache interface {
@@ -75,65 +86,122 @@ type InteractionClient interface {
 type VideoService struct {
 	repo        VideoRepository
 	cache       Cache
-	storage     FileStorage
+	videos      FileStorage
+	thumbs      FileStorage
 	interaction InteractionClient
 }
 
-func NewVideoService(repo VideoRepository, cache Cache, storage FileStorage, interaction InteractionClient) *VideoService {
-	return &VideoService{repo: repo, cache: cache, storage: storage, interaction: interaction}
+func NewVideoService(repo VideoRepository, cache Cache, videos, thumbs FileStorage, interaction InteractionClient) *VideoService {
+	return &VideoService{repo: repo, cache: cache, videos: videos, thumbs: thumbs, interaction: interaction}
 }
 
-type UploadInput struct {
-	AuthorID    int64
-	AuthorName  string
-	Title       string
-	Description string
-	FileName    string // исходное имя файла от клиента, нужно только для расширения
-	File        io.Reader
+// Actor — кто выполняет действие. Администратор может менять любые видео.
+type Actor struct {
+	UserID  int64
+	IsAdmin bool
 }
 
-func (s *VideoService) Upload(ctx context.Context, in UploadInput) (*model.Video, error) {
-	title := strings.TrimSpace(in.Title)
-	description := strings.TrimSpace(in.Description)
+func (a Actor) canEdit(v *model.Video) bool {
+	return a.IsAdmin || v.AuthorID == a.UserID
+}
 
-	if n := utf8.RuneCountInString(title); n == 0 || n > 200 {
-		return nil, &ValidationError{"title is required and must be at most 200 characters"}
-	}
-	if utf8.RuneCountInString(description) > 5000 {
-		return nil, &ValidationError{"description must be at most 5000 characters"}
-	}
+// ---------- Загрузка ----------
 
-	ext := strings.ToLower(filepath.Ext(in.FileName))
+// StoredFile — видеофайл, уже записанный в хранилище, но ещё не сохранённый в БД.
+type StoredFile struct {
+	Name        string
+	Size        int64
+	ContentType string
+}
+
+// SaveVideoFile потоково пишет видео прямо в хранилище — без промежуточных временных файлов.
+// Формат проверяется по расширению до начала записи.
+func (s *VideoService) SaveVideoFile(src io.Reader, originalName string) (*StoredFile, error) {
+	ext := strings.ToLower(filepath.Ext(originalName))
 	contentType, ok := allowedFormats[ext]
 	if !ok {
 		return nil, &ValidationError{"unsupported file format, allowed: mp4, webm, mov, mkv"}
 	}
-
-	fileName, size, err := s.storage.Save(in.File, ext)
+	name, size, err := s.videos.Save(src, ext)
 	if err != nil {
 		return nil, fmt.Errorf("save file: %w", err)
 	}
 	if size == 0 {
-		_ = s.storage.Remove(fileName)
+		_ = s.videos.Remove(name)
 		return nil, &ValidationError{"file is empty"}
+	}
+	return &StoredFile{Name: name, Size: size, ContentType: contentType}, nil
+}
+
+// DiscardVideoFile удаляет файл, если загрузку пришлось прервать.
+func (s *VideoService) DiscardVideoFile(f *StoredFile) {
+	if f != nil {
+		_ = s.videos.Remove(f.Name)
+	}
+}
+
+type CreateInput struct {
+	AuthorID        int64
+	AuthorName      string
+	Title           string
+	Description     string
+	DurationSeconds int
+	File            *StoredFile
+	Thumbnail       []byte // необязательно: кадр, который браузер вырезал из видео
+}
+
+func (s *VideoService) Create(ctx context.Context, in CreateInput) (*model.Video, error) {
+	if in.File == nil {
+		return nil, &ValidationError{"field 'file' is required"}
+	}
+	title, description, err := validateInfo(in.Title, in.Description)
+	if err != nil {
+		s.DiscardVideoFile(in.File)
+		return nil, err
+	}
+
+	var thumbName string
+	if len(in.Thumbnail) > 0 {
+		if thumbName, err = s.saveThumbnail(in.Thumbnail); err != nil {
+			s.DiscardVideoFile(in.File)
+			return nil, err
+		}
 	}
 
 	video := &model.Video{
-		AuthorID:    in.AuthorID,
-		AuthorName:  in.AuthorName,
-		Title:       title,
-		Description: description,
-		FileName:    fileName,
-		ContentType: contentType,
-		SizeBytes:   size,
+		AuthorID:        in.AuthorID,
+		AuthorName:      in.AuthorName,
+		Title:           title,
+		Description:     description,
+		FileName:        in.File.Name,
+		ThumbnailFile:   thumbName,
+		ContentType:     in.File.ContentType,
+		SizeBytes:       in.File.Size,
+		DurationSeconds: max(0, min(in.DurationSeconds, 24*3600)),
 	}
 	if err := s.repo.Create(ctx, video); err != nil {
-		// Запись в БД не удалась — удаляем файл, чтобы не копить «мусор» на диске.
-		_ = s.storage.Remove(fileName)
+		// Запись в БД не удалась — удаляем файлы, чтобы не копить «мусор» на диске.
+		s.DiscardVideoFile(in.File)
+		s.removeThumb(thumbName)
 		return nil, fmt.Errorf("create video: %w", err)
 	}
+	video.FillURLs()
 	return video, nil
 }
+
+func validateInfo(title, description string) (string, string, error) {
+	title = strings.TrimSpace(title)
+	description = strings.TrimSpace(description)
+	if n := utf8.RuneCountInString(title); n == 0 || n > 200 {
+		return "", "", &ValidationError{"title is required and must be at most 200 characters"}
+	}
+	if utf8.RuneCountInString(description) > 5000 {
+		return "", "", &ValidationError{"description must be at most 5000 characters"}
+	}
+	return title, description, nil
+}
+
+// ---------- Просмотр ----------
 
 // Get возвращает карточку видео: сначала ищет в Redis, при промахе идёт в БД.
 func (s *VideoService) Get(ctx context.Context, id int64) (*model.Video, error) {
@@ -159,6 +227,7 @@ func (s *VideoService) Get(ctx context.Context, id int64) (*model.Video, error) 
 	if pending, err := s.cache.PendingViews(ctx, id); err == nil {
 		video.Views += pending
 	}
+	video.FillURLs()
 	return video, nil
 }
 
@@ -173,6 +242,7 @@ func (s *VideoService) List(ctx context.Context, search string, authorID int64, 
 	if err != nil {
 		return nil, err
 	}
+	fillAll(videos)
 	return &model.VideoPage{Items: videos, Total: total, Page: page, Limit: limit}, nil
 }
 
@@ -185,43 +255,181 @@ func (s *VideoService) Popular(ctx context.Context) ([]model.Video, error) {
 	if err != nil {
 		return nil, err
 	}
+	fillAll(videos)
 	if err := s.cache.SetPopular(ctx, videos); err != nil {
 		slog.Warn("cache write failed", "key", "popular", "err", err)
 	}
 	return videos, nil
 }
 
-func (s *VideoService) Delete(ctx context.Context, id, userID int64) error {
-	video, err := s.repo.GetByID(ctx, id)
-	if errors.Is(err, repository.ErrNotFound) {
-		return ErrNotFound
+// Recommendations — видео для колонки справа: сначала этого автора, потом похожие, потом остальные.
+func (s *VideoService) Recommendations(ctx context.Context, id int64, limit int) ([]model.Video, error) {
+	video, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, err
 	}
+	query := buildTSQuery(video.Title + " " + video.Description)
+	videos, err := s.repo.Recommendations(ctx, id, video.AuthorID, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	fillAll(videos)
+	return videos, nil
+}
+
+// buildTSQuery превращает текст в запрос вида "слово1 | слово2 | ...":
+// видео считается похожим, если совпадает хотя бы одно значимое слово.
+// В запрос попадают только буквы и цифры, поэтому спецсимволы tsquery внедрить нельзя.
+func buildTSQuery(text string) string {
+	seen := make(map[string]bool)
+	var words []string
+	for _, w := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if utf8.RuneCountInString(w) < 2 || seen[w] {
+			continue
+		}
+		seen[w] = true
+		words = append(words, w)
+		if len(words) == 20 {
+			break
+		}
+	}
+	return strings.Join(words, " | ")
+}
+
+// ---------- Редактирование ----------
+
+func (s *VideoService) UpdateInfo(ctx context.Context, actor Actor, id int64, title, description string) (*model.Video, error) {
+	if _, err := s.editable(ctx, actor, id); err != nil {
+		return nil, err
+	}
+	title, description, err := validateInfo(title, description)
+	if err != nil {
+		return nil, err
+	}
+	video, err := s.repo.UpdateInfo(ctx, id, title, description)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.invalidate(ctx, id)
+	video.FillURLs()
+	return video, nil
+}
+
+// SetThumbnail заменяет превью видео (JPEG, PNG или WebP до 5 МБ).
+func (s *VideoService) SetThumbnail(ctx context.Context, actor Actor, id int64, data []byte) (*model.Video, error) {
+	old, err := s.editable(ctx, actor, id)
+	if err != nil {
+		return nil, err
+	}
+	name, err := s.saveThumbnail(data)
+	if err != nil {
+		return nil, err
+	}
+	video, err := s.repo.SetThumbnail(ctx, id, name)
+	if err != nil {
+		s.removeThumb(name)
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	s.removeThumb(old.ThumbnailFile)
+	s.invalidate(ctx, id)
+	video.FillURLs()
+	return video, nil
+}
+
+func (s *VideoService) OpenThumbnail(ctx context.Context, id int64) (*model.Video, *os.File, error) {
+	video, err := s.Get(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if video.ThumbnailFile == "" {
+		return nil, nil, ErrNotFound
+	}
+	f, err := s.thumbs.Open(video.ThumbnailFile)
+	if err != nil {
+		return nil, nil, ErrNotFound
+	}
+	return video, f, nil
+}
+
+func (s *VideoService) saveThumbnail(data []byte) (string, error) {
+	if len(data) > maxThumbnailBytes {
+		return "", &ValidationError{"thumbnail must be at most 5 MB"}
+	}
+	var ext string
+	switch http.DetectContentType(data) {
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/png":
+		ext = ".png"
+	case "image/webp":
+		ext = ".webp"
+	default:
+		return "", &ValidationError{"thumbnail must be a JPEG, PNG or WebP image"}
+	}
+	name, _, err := s.thumbs.Save(bytes.NewReader(data), ext)
+	if err != nil {
+		return "", fmt.Errorf("save thumbnail: %w", err)
+	}
+	return name, nil
+}
+
+// ---------- Удаление ----------
+
+func (s *VideoService) Delete(ctx context.Context, actor Actor, id int64) error {
+	video, err := s.editable(ctx, actor, id)
 	if err != nil {
 		return err
 	}
-	if video.AuthorID != userID {
-		return ErrForbidden
-	}
-
 	if err := s.repo.Delete(ctx, id); err != nil {
 		if errors.Is(err, repository.ErrNotFound) {
 			return ErrNotFound
 		}
 		return err
 	}
-	if err := s.storage.Remove(video.FileName); err != nil {
-		slog.Warn("failed to remove video file", "file", video.FileName, "err", err)
+	s.cleanupDeleted(ctx, *video)
+	return nil
+}
+
+// DeleteUserVideos удаляет все видео пользователя (вызывается auth-service при удалении аккаунта).
+func (s *VideoService) DeleteUserVideos(ctx context.Context, authorID int64) (int, error) {
+	videos, err := s.repo.DeleteByAuthor(ctx, authorID)
+	if err != nil {
+		return 0, err
 	}
-	_ = s.cache.DeleteVideo(ctx, id)
-	_ = s.cache.InvalidatePopular(ctx)
+	for _, v := range videos {
+		s.cleanupDeleted(ctx, v)
+	}
+	return len(videos), nil
+}
+
+// cleanupDeleted убирает всё, что связано с удалённым видео: файлы, кеш, комментарии и лайки.
+func (s *VideoService) cleanupDeleted(ctx context.Context, v model.Video) {
+	if err := s.videos.Remove(v.FileName); err != nil {
+		slog.Warn("failed to remove video file", "file", v.FileName, "err", err)
+	}
+	s.removeThumb(v.ThumbnailFile)
+	s.invalidate(ctx, v.ID)
 
 	// Комментарии и лайки хранятся в другом сервисе — просим его удалить их.
 	// Ошибка здесь не критична для пользователя, поэтому только логируем её.
-	if err := s.interaction.DeleteVideoData(ctx, id); err != nil {
-		slog.Warn("failed to delete video interactions", "video_id", id, "err", err)
+	if err := s.interaction.DeleteVideoData(ctx, v.ID); err != nil {
+		slog.Warn("failed to delete video interactions", "video_id", v.ID, "err", err)
 	}
-	return nil
 }
+
+func (s *VideoService) AdminStats(ctx context.Context) (*model.Stats, error) {
+	return s.repo.Stats(ctx)
+}
+
+// ---------- Видеофайл и просмотры ----------
 
 // OpenStream открывает файл видео для отдачи клиенту. Файл закрывает вызывающий код.
 func (s *VideoService) OpenStream(ctx context.Context, id int64) (*model.Video, *os.File, error) {
@@ -229,7 +437,7 @@ func (s *VideoService) OpenStream(ctx context.Context, id int64) (*model.Video, 
 	if err != nil {
 		return nil, nil, err
 	}
-	f, err := s.storage.Open(video.FileName)
+	f, err := s.videos.Open(video.FileName)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil, ErrNotFound
@@ -281,5 +489,42 @@ func (s *VideoService) flushViews(ctx context.Context) {
 	}
 	if len(views) > 0 {
 		slog.Info("views flushed to database", "videos", len(views))
+	}
+}
+
+// ---------- Вспомогательное ----------
+
+// editable загружает видео из БД и проверяет, что actor может его менять.
+func (s *VideoService) editable(ctx context.Context, actor Actor, id int64) (*model.Video, error) {
+	video, err := s.repo.GetByID(ctx, id)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !actor.canEdit(video) {
+		return nil, ErrForbidden
+	}
+	return video, nil
+}
+
+func (s *VideoService) invalidate(ctx context.Context, id int64) {
+	_ = s.cache.DeleteVideo(ctx, id)
+	_ = s.cache.InvalidatePopular(ctx)
+}
+
+func (s *VideoService) removeThumb(name string) {
+	if name == "" {
+		return
+	}
+	if err := s.thumbs.Remove(name); err != nil {
+		slog.Warn("failed to remove thumbnail", "file", name, "err", err)
+	}
+}
+
+func fillAll(videos []model.Video) {
+	for i := range videos {
+		videos[i].FillURLs()
 	}
 }

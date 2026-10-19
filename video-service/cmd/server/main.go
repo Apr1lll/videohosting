@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -43,16 +44,22 @@ func main() {
 	}
 	defer rdb.Close()
 
-	fileStorage, err := storage.NewLocalStorage(cfg.StoragePath)
+	videoStorage, err := storage.NewLocalStorage(cfg.StoragePath)
 	if err != nil {
 		slog.Error("cannot init storage", "err", err)
+		os.Exit(1)
+	}
+	thumbStorage, err := storage.NewLocalStorage(filepath.Join(cfg.StoragePath, "thumbs"))
+	if err != nil {
+		slog.Error("cannot init thumbnail storage", "err", err)
 		os.Exit(1)
 	}
 
 	svc := service.NewVideoService(
 		repository.NewVideoRepository(pool),
 		cache.New(rdb, cfg.CacheTTL),
-		fileStorage,
+		videoStorage,
+		thumbStorage,
 		client.NewInteractionClient(cfg.InteractionServiceURL),
 	)
 	h := handler.New(svc, cfg.MaxUploadBytes)

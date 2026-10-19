@@ -101,11 +101,84 @@ check "поддельный токен" 401 "$code"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/videos/$VIDEO_ID" -H "Authorization: Bearer $BOB_TOKEN")
 check "удаление чужого видео" 403 "$code"
 
+echo "== Превью, аватарки, редактирование"
+# Минимальный JPEG: серверу достаточно сигнатуры FF D8 FF, чтобы распознать тип картинки.
+{ printf '\xff\xd8\xff\xe0\x00\x10JFIF\x00'; head -c 2000 /dev/urandom; } > "$TMP/pic.jpg"
+resp=$(curl -s -X POST "$API/videos" -H "$AUTH" -F "title=Видео с превью про котиков" -F "duration=125" \
+  -F "thumbnail=@$TMP/pic.jpg" -F "file=@$TMP/test.mp4")
+V2=$(echo "$resp" | json_field id)
+dur=$(echo "$resp" | json_field duration_seconds)
+check "загрузка с превью и длительностью" 125 "$dur"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/videos/$V2/thumbnail")
+check "превью отдаётся" 200 "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$API/videos/$V2/thumbnail" -H "$AUTH" -F "thumbnail=@$TMP/bad.txt")
+check "превью не картинкой отклоняется" 400 "$code"
+title=$(curl -s -X PATCH "$API/videos/$V2" -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"title":"Новое название про котиков","description":"обновили"}' | json_field title)
+check "редактирование видео" "Новое название про котиков" "$title"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "$API/videos/$V2" -H "Authorization: Bearer $BOB_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"title":"взлом","description":""}')
+check "чужое видео редактировать нельзя" 403 "$code"
+ctype=$(curl -s -o /dev/null -w '%{content_type}' "$API/users/$BOB_ID/avatar")
+check "аватарка по умолчанию (SVG)" "image/svg+xml" "$ctype"
+has=$(curl -s -X PUT "$API/users/me/avatar" -H "$AUTH" -F "avatar=@$TMP/pic.jpg" | json_field has_avatar)
+check "загрузка аватарки" true "$has"
+
+echo "== Рекомендации"
+curl -s -o /dev/null -X POST "$API/videos" -H "Authorization: Bearer $BOB_TOKEN" -F "title=Смешные котики компиляция" -F "file=@$TMP/test.mp4"
+curl -s -o /dev/null -X POST "$API/videos" -H "Authorization: Bearer $BOB_TOKEN" -F "title=Ремонт кухни своими руками" -F "file=@$TMP/test.mp4"
+rec=$(curl -s "$API/videos/$V2/recommendations?limit=5")
+first=$(echo "$rec" | grep -o '"title":"[^"]*"' | head -1 | cut -d'"' -f4)
+second=$(echo "$rec" | grep -o '"title":"[^"]*"' | sed -n 2p | cut -d'"' -f4)
+check "1-е место: другое видео этого же автора" "Мой первый ролик" "$first"
+check "2-е место: похожее по теме (котики)" "Смешные котики компиляция" "$second"
+
+echo "== Ответы и редактирование комментариев"
+PARENT=$(curl -s -X POST "$API/videos/$V2/comments" -H "$AUTH" -H 'Content-Type: application/json' -d '{"text":"Корневой"}' | json_field id)
+curl -s -o /dev/null -X POST "$API/videos/$V2/comments" -H "Authorization: Bearer $BOB_TOKEN" -H 'Content-Type: application/json' -d "{\"text\":\"Ответ\",\"parent_id\":$PARENT}"
+n=$(curl -s "$API/videos/$V2/comments" | json_field reply_count)
+check "у комментария 1 ответ" 1 "$n"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/comments/$PARENT/replies")
+check "список ответов" 200 "$code"
+edited=$(curl -s -X PATCH "$API/comments/$PARENT" -H "$AUTH" -H 'Content-Type: application/json' -d '{"text":"Исправлено"}' | json_field text)
+check "редактирование своего комментария" "Исправлено" "$edited"
+
+echo "== Подписчики и подписка на пустой канал"
+resp=$(curl -s -X POST "$API/auth/register" -H 'Content-Type: application/json' \
+  -d "{\"username\":\"empty$SUFFIX\",\"email\":\"empty$SUFFIX@mail.ru\",\"password\":\"secret123\"}")
+EMPTY_ID=$(echo "$resp" | json_field id)
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/channels/$EMPTY_ID/subscribe" -H "$AUTH")
+check "подписка на канал без видео" 200 "$code"
+subs=$(curl -s "$API/users/me/subscribers" -H "Authorization: Bearer $BOB_TOKEN" | grep -o "alice$SUFFIX" | head -1)
+check "bob видит подписчика alice" "alice$SUFFIX" "$subs"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$API/admin/users" -H "$AUTH")
+check "обычному пользователю админка закрыта" 403 "$code"
+
+if [ -n "${ADMIN_EMAIL:-}" ] && [ -n "${ADMIN_PASSWORD:-}" ]; then
+  echo "== Админ-панель"
+  ADM=$(curl -s -X POST "$API/auth/login" -H 'Content-Type: application/json' \
+    -d "{\"email\":\"$ADMIN_EMAIL\",\"password\":\"$ADMIN_PASSWORD\"}" | json_field token)
+  ADM="Authorization: Bearer $ADM"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$API/admin/users?search=alice$SUFFIX" -H "$ADM")
+  check "админ видит пользователей" 200 "$code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' "$API/admin/videos/stats" -H "$ADM")
+  check "статистика видео" 200 "$code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X PATCH "$API/comments/$PARENT" -H "$ADM" -H 'Content-Type: application/json' -d '{"text":"Отмодерировано"}')
+  check "админ редактирует чужой комментарий" 200 "$code"
+  code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/admin/users/$BOB_ID" -H "$ADM")
+  check "админ удаляет пользователя bob" 204 "$code"
+  left=$(curl -s "$API/videos?search=Смешные%20котики" | json_field total)
+  check "видео bob удалены вместе с ним" 0 "$left"
+else
+  echo "  (админ-проверки пропущены: задайте ADMIN_EMAIL и ADMIN_PASSWORD, чтобы их запустить)"
+fi
+
 echo "== Удаление"
 code=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "$API/videos/$VIDEO_ID" -H "$AUTH")
 check "удаление своего видео" 204 "$code"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$API/videos/$VIDEO_ID")
 check "видео больше не найдено" 404 "$code"
+curl -s -o /dev/null -X DELETE "$API/videos/$V2" -H "$AUTH"
 
 rm -rf "$TMP"
 echo

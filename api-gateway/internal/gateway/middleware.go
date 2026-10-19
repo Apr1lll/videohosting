@@ -60,7 +60,7 @@ func Logging(next http.Handler) http.Handler {
 func CORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range")
 		w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID, Content-Range, Accept-Ranges")
 		if r.Method == http.MethodOptions {
@@ -125,8 +125,15 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
+// Middleware ограничивает только изменяющие запросы (POST, PATCH, PUT, DELETE):
+// перебор паролей, спам комментариями, массовые загрузки. Чтение (страницы, превью,
+// аватарки, видео) не ограничиваем — одна страница сайта тянет десятки картинок.
 func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if !rl.Allow(clientIP(r)) {
 			w.Header().Set("Retry-After", "60")
 			writeError(w, http.StatusTooManyRequests, "too many requests, try again later")

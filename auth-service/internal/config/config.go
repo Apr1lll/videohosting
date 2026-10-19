@@ -3,14 +3,19 @@ package config
 
 import (
 	"os"
+	"strings"
 	"time"
 )
 
 type Config struct {
-	HTTPAddr    string
-	DatabaseURL string
-	JWTSecret   string
-	TokenTTL    time.Duration
+	HTTPAddr              string
+	DatabaseURL           string
+	JWTSecret             string
+	TokenTTL              time.Duration
+	AvatarPath            string
+	AdminUsernames        []string // эти пользователи автоматически получают роль admin
+	VideoServiceURL       string
+	InteractionServiceURL string
 }
 
 func Load() Config {
@@ -19,11 +24,22 @@ func Load() Config {
 		ttl = 24 * time.Hour
 	}
 
+	var admins []string
+	for _, name := range strings.Split(getEnv("ADMIN_USERNAMES", "apr1l"), ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			admins = append(admins, name)
+		}
+	}
+
 	return Config{
-		HTTPAddr:    getEnv("HTTP_ADDR", ":8081"),
-		DatabaseURL: getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/auth_db?sslmode=disable"),
-		JWTSecret:   getEnv("JWT_SECRET", "dev-secret-change-me"),
-		TokenTTL:    ttl,
+		HTTPAddr:              getEnv("HTTP_ADDR", ":8081"),
+		DatabaseURL:           getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/auth_db?sslmode=disable"),
+		JWTSecret:             getEnv("JWT_SECRET", "dev-secret-change-me"),
+		TokenTTL:              ttl,
+		AvatarPath:            getEnv("AVATAR_PATH", "./data/avatars"),
+		AdminUsernames:        admins,
+		VideoServiceURL:       getEnv("VIDEO_SERVICE_URL", "http://localhost:8082"),
+		InteractionServiceURL: getEnv("INTERACTION_SERVICE_URL", "http://localhost:8083"),
 	}
 }
 

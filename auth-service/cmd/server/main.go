@@ -10,11 +10,13 @@ import (
 	"syscall"
 	"time"
 
+	"videohosting/auth-service/internal/client"
 	"videohosting/auth-service/internal/config"
 	"videohosting/auth-service/internal/database"
 	"videohosting/auth-service/internal/handler"
 	"videohosting/auth-service/internal/repository"
 	"videohosting/auth-service/internal/service"
+	"videohosting/auth-service/internal/storage"
 )
 
 func main() {
@@ -31,8 +33,20 @@ func main() {
 	}
 	defer pool.Close()
 
-	repo := repository.NewUserRepository(pool)
-	svc := service.NewAuthService(repo, cfg.JWTSecret, cfg.TokenTTL)
+	avatars, err := storage.NewLocalStorage(cfg.AvatarPath)
+	if err != nil {
+		slog.Error("cannot init avatar storage", "err", err)
+		os.Exit(1)
+	}
+
+	svc := service.NewAuthService(
+		repository.NewUserRepository(pool),
+		avatars,
+		client.NewUserDataCleaner(cfg.VideoServiceURL, cfg.InteractionServiceURL),
+		cfg.AdminUsernames,
+		cfg.JWTSecret,
+		cfg.TokenTTL,
+	)
 	h := handler.New(svc)
 
 	srv := &http.Server{
@@ -40,7 +54,7 @@ func main() {
 		Handler:           h.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      15 * time.Second,
+		WriteTimeout:      90 * time.Second, // удаление пользователя с большим числом видео
 	}
 
 	go func() {

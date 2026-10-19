@@ -14,7 +14,15 @@ var ErrInvalidToken = errors.New("invalid or expired token")
 // Claims должны совпадать со структурой в auth-service.
 type Claims struct {
 	Username string `json:"username"`
+	Role     string `json:"role"`
 	jwt.RegisteredClaims
+}
+
+// Identity — проверенные данные пользователя из токена.
+type Identity struct {
+	UserID   int64
+	Username string
+	Role     string
 }
 
 type Verifier struct {
@@ -25,11 +33,11 @@ func NewVerifier(secret string) *Verifier {
 	return &Verifier{secret: []byte(secret)}
 }
 
-// Verify разбирает заголовок "Authorization: Bearer <token>" и возвращает ID и имя пользователя.
-func (v *Verifier) Verify(header string) (userID int64, username string, err error) {
+// Verify разбирает заголовок "Authorization: Bearer <token>" и возвращает данные пользователя.
+func (v *Verifier) Verify(header string) (*Identity, error) {
 	raw, ok := strings.CutPrefix(header, "Bearer ")
 	if !ok || raw == "" {
-		return 0, "", ErrInvalidToken
+		return nil, ErrInvalidToken
 	}
 
 	claims := &Claims{}
@@ -37,12 +45,16 @@ func (v *Verifier) Verify(header string) (userID int64, username string, err err
 		return v.secret, nil
 	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithExpirationRequired())
 	if err != nil || !token.Valid {
-		return 0, "", ErrInvalidToken
+		return nil, ErrInvalidToken
 	}
 
-	userID, err = strconv.ParseInt(claims.Subject, 10, 64)
+	userID, err := strconv.ParseInt(claims.Subject, 10, 64)
 	if err != nil || userID <= 0 {
-		return 0, "", ErrInvalidToken
+		return nil, ErrInvalidToken
 	}
-	return userID, claims.Username, nil
+	role := claims.Role
+	if role == "" {
+		role = "user" // токены, выданные до появления ролей
+	}
+	return &Identity{UserID: userID, Username: claims.Username, Role: role}, nil
 }

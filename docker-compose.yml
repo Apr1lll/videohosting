@@ -59,6 +59,12 @@ services:
       DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/auth_db?sslmode=disable
       JWT_SECRET: ${JWT_SECRET:-super-secret-key-change-me}
       TOKEN_TTL: 24h
+      AVATAR_PATH: /data/avatars
+      ADMIN_USERNAMES: ${ADMIN_USERNAMES:-apr1l}   # эти пользователи получают права администратора
+      VIDEO_SERVICE_URL: http://video-service:8082
+      INTERACTION_SERVICE_URL: http://interaction-service:8083
+    volumes:
+      - avatars:/data/avatars
     depends_on:
       migrate-auth:
         condition: service_completed_successfully
@@ -108,7 +114,7 @@ services:
       AUTH_SERVICE_URL: http://auth-service:8081
       VIDEO_SERVICE_URL: http://video-service:8082
       INTERACTION_SERVICE_URL: http://interaction-service:8083
-      RATE_LIMIT_PER_MINUTE: "300"
+      RATE_LIMIT_PER_MINUTE: "300"   # только для POST/PATCH/PUT/DELETE
       WEB_DIR: /web
     volumes:
       - ./frontend:/web:ro       # фронтенд раздаёт сам gateway
@@ -122,4 +128,5 @@ services:
 
 volumes:
   pgdata:
+  avatars:
   videos:

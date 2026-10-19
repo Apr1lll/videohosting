@@ -3,6 +3,7 @@ package handler
 
 import (
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -28,8 +29,17 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /videos", h.list)
 	mux.HandleFunc("GET /videos/popular", h.popular)
 	mux.HandleFunc("GET /videos/{id}", h.get)
-	mux.HandleFunc("GET /videos/{id}/stream", h.stream)
+	mux.HandleFunc("PATCH /videos/{id}", h.update)
 	mux.HandleFunc("DELETE /videos/{id}", h.delete)
+	mux.HandleFunc("GET /videos/{id}/stream", h.stream)
+	mux.HandleFunc("GET /videos/{id}/thumbnail", h.thumbnail)
+	mux.HandleFunc("PUT /videos/{id}/thumbnail", h.setThumbnail)
+	mux.HandleFunc("GET /videos/{id}/recommendations", h.recommendations)
+
+	mux.HandleFunc("GET /admin/videos/stats", h.adminStats)
+
+	// Внутренний эндпоинт: вызывает auth-service при удалении пользователя.
+	mux.HandleFunc("DELETE /internal/users/{id}/videos", h.deleteUserVideos)
 	return httpx.Recover(httpx.Logging(mux))
 }
 
@@ -37,7 +47,16 @@ func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// upload принимает multipart/form-data с полями title, description и файлом file.
+func actor(r *http.Request) (service.Actor, bool) {
+	id, ok := httpx.UserID(r)
+	return service.Actor{UserID: id, IsAdmin: httpx.IsAdmin(r)}, ok
+}
+
+// upload принимает multipart/form-data: title, description, duration, thumbnail (картинка) и file.
+//
+// Тело читается потоково через MultipartReader: видео пишется сразу в хранилище,
+// без копии во временную папку, как было бы с ParseMultipartForm. Это вдвое сокращает
+// запись на диск и заметно ускоряет загрузку больших файлов.
 func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 	userID, ok := httpx.UserID(r)
 	if !ok {
@@ -46,38 +65,72 @@ func (h *Handler) upload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, h.maxUploadBytes)
-	// Первые 32 МБ держим в памяти, остальное Go сам сбросит во временный файл.
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		var tooBig *http.MaxBytesError
-		if errors.As(err, &tooBig) {
-			httpx.WriteError(w, http.StatusRequestEntityTooLarge, "file is too large")
+	reader, err := r.MultipartReader()
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "expected multipart/form-data")
+		return
+	}
+
+	in := service.CreateInput{AuthorID: userID, AuthorName: r.Header.Get("X-Username")}
+	fail := func(err error) {
+		h.svc.DiscardVideoFile(in.File)
+		h.handleError(w, err)
+	}
+
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fail(err)
 			return
 		}
-		httpx.WriteError(w, http.StatusBadRequest, "invalid multipart form: "+err.Error())
-		return
-	}
-	defer func() { _ = r.MultipartForm.RemoveAll() }()
 
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		httpx.WriteError(w, http.StatusBadRequest, "field 'file' is required")
-		return
+		switch part.FormName() {
+		case "title":
+			in.Title, err = readField(part, 1<<10)
+		case "description":
+			in.Description, err = readField(part, 32<<10)
+		case "duration":
+			var raw string
+			if raw, err = readField(part, 32); err == nil {
+				f, _ := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+				in.DurationSeconds = int(f + 0.5)
+			}
+		case "thumbnail":
+			in.Thumbnail, err = io.ReadAll(io.LimitReader(part, 5<<20+1))
+		case "file":
+			if in.File != nil {
+				err = &service.ValidationError{Msg: "only one file can be uploaded"}
+				break
+			}
+			in.File, err = h.svc.SaveVideoFile(part, part.FileName())
+		}
+		part.Close()
+		if err != nil {
+			fail(err)
+			return
+		}
 	}
-	defer file.Close()
 
-	video, err := h.svc.Upload(r.Context(), service.UploadInput{
-		AuthorID:    userID,
-		AuthorName:  r.Header.Get("X-Username"),
-		Title:       r.FormValue("title"),
-		Description: r.FormValue("description"),
-		FileName:    header.Filename,
-		File:        file,
-	})
+	video, err := h.svc.Create(r.Context(), in)
 	if err != nil {
-		h.handleError(w, err)
+		h.handleError(w, err) // Create сам удаляет файл при ошибке
 		return
 	}
 	httpx.WriteJSON(w, http.StatusCreated, video)
+}
+
+func readField(r io.Reader, limit int64) (string, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(data)) > limit {
+		return "", &service.ValidationError{Msg: "form field is too long"}
+	}
+	return string(data), nil
 }
 
 // list: GET /videos?search=котики&author_id=1&page=1&limit=20
@@ -125,8 +178,105 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, video)
 }
 
+func (h *Handler) recommendations(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 || limit > 50 {
+		limit = 20
+	}
+	videos, err := h.svc.Recommendations(r.Context(), id, limit)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]any{"items": videos})
+}
+
+type updateRequest struct {
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+// update меняет название и описание. Доступно автору видео и администратору.
+func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
+	a, ok := actor(r)
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "authorization required")
+		return
+	}
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req updateRequest
+	if err := httpx.DecodeJSON(w, r, &req); err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	video, err := h.svc.UpdateInfo(r.Context(), a, id, req.Title, req.Description)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, video)
+}
+
+// setThumbnail заменяет превью: multipart-поле "thumbnail" с картинкой.
+func (h *Handler) setThumbnail(w http.ResponseWriter, r *http.Request) {
+	a, ok := actor(r)
+	if !ok {
+		httpx.WriteError(w, http.StatusUnauthorized, "authorization required")
+		return
+	}
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
+	file, _, err := r.FormFile("thumbnail")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, "field 'thumbnail' is required")
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	video, err := h.svc.SetThumbnail(r.Context(), a, id, data)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, video)
+}
+
+func (h *Handler) thumbnail(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	video, file, err := h.svc.OpenThumbnail(r.Context(), id)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	defer file.Close()
+	// Ссылка содержит ?v=<время изменения>, поэтому картинку можно кешировать надолго.
+	w.Header().Set("Cache-Control", "public, max-age=604800, immutable")
+	http.ServeContent(w, r, video.ThumbnailFile, video.UpdatedAt, file)
+}
+
 // stream отдаёт файл видео. http.ServeContent сам поддерживает заголовок Range,
-// поэтому в браузерном плеере работает перемотка.
+// поэтому в плеере работает перемотка.
 func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 	id, err := httpx.PathID(r, "id")
 	if err != nil {
@@ -145,6 +295,9 @@ func (h *Handler) stream(w http.ResponseWriter, r *http.Request) {
 		h.svc.RegisterView(r.Context(), id)
 	}
 
+	// Видеофайл после загрузки не меняется — браузер может держать его в кеше
+	// и при повторном просмотре не скачивать заново.
+	w.Header().Set("Cache-Control", "public, max-age=86400")
 	w.Header().Set("Content-Type", video.ContentType)
 	http.ServeContent(w, r, video.FileName, video.CreatedAt, file)
 }
@@ -157,7 +310,7 @@ func isFirstChunk(r *http.Request) bool {
 }
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
-	userID, ok := httpx.UserID(r)
+	a, ok := actor(r)
 	if !ok {
 		httpx.WriteError(w, http.StatusUnauthorized, "authorization required")
 		return
@@ -167,18 +320,48 @@ func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := h.svc.Delete(r.Context(), id, userID); err != nil {
+	if err := h.svc.Delete(r.Context(), a, id); err != nil {
 		h.handleError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *Handler) adminStats(w http.ResponseWriter, r *http.Request) {
+	if !httpx.IsAdmin(r) {
+		httpx.WriteError(w, http.StatusForbidden, "admin rights required")
+		return
+	}
+	stats, err := h.svc.AdminStats(r.Context())
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, stats)
+}
+
+func (h *Handler) deleteUserVideos(w http.ResponseWriter, r *http.Request) {
+	id, err := httpx.PathID(r, "id")
+	if err != nil {
+		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	n, err := h.svc.DeleteUserVideos(r.Context(), id)
+	if err != nil {
+		h.handleError(w, err)
+		return
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]int{"deleted": n})
+}
+
 func (h *Handler) handleError(w http.ResponseWriter, err error) {
 	var vErr *service.ValidationError
+	var tooBig *http.MaxBytesError
 	switch {
 	case errors.As(err, &vErr):
 		httpx.WriteError(w, http.StatusBadRequest, vErr.Msg)
+	case errors.As(err, &tooBig):
+		httpx.WriteError(w, http.StatusRequestEntityTooLarge, "file is too large")
 	case errors.Is(err, service.ErrNotFound):
 		httpx.WriteError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, service.ErrForbidden):

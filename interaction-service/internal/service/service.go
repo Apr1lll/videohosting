@@ -18,7 +18,7 @@ var (
 	ErrCommentNotFound = errors.New("comment not found")
 	ErrChannelNotFound = errors.New("channel not found")
 	ErrNotSubscribed   = errors.New("you are not subscribed to this channel")
-	ErrForbidden       = errors.New("you can delete only your own comments")
+	ErrForbidden       = errors.New("you can change only your own comments")
 )
 
 type ValidationError struct {
@@ -31,16 +31,22 @@ type Repository interface {
 	CreateComment(ctx context.Context, c *model.Comment) error
 	GetComment(ctx context.Context, id int64) (*model.Comment, error)
 	ListComments(ctx context.Context, videoID int64, limit, offset int) ([]model.Comment, int, error)
+	ListReplies(ctx context.Context, parentID int64) ([]model.Comment, error)
+	AdminListComments(ctx context.Context, search string, limit, offset int) ([]model.Comment, int, error)
+	UpdateComment(ctx context.Context, id int64, text string) error
 	DeleteComment(ctx context.Context, id int64) error
 	GetReaction(ctx context.Context, videoID, userID int64) (int16, error)
 	SetReaction(ctx context.Context, videoID, userID int64, value int16) error
 	RemoveReaction(ctx context.Context, videoID, userID int64) error
 	CountReactions(ctx context.Context, videoID int64) (int64, int64, error)
-	Subscribe(ctx context.Context, subscriberID, channelID int64, channelName string) error
+	Subscribe(ctx context.Context, subscriberID int64, subscriberName string, channelID int64, channelName string) error
 	Unsubscribe(ctx context.Context, subscriberID, channelID int64) error
 	ListSubscriptions(ctx context.Context, subscriberID int64) ([]model.Subscription, error)
+	ListSubscribers(ctx context.Context, channelID int64) ([]model.Subscriber, error)
 	CountSubscribers(ctx context.Context, channelID int64) (int64, error)
 	DeleteVideoData(ctx context.Context, videoID int64) error
+	DeleteUserData(ctx context.Context, userID int64) ([]int64, error)
+	Stats(ctx context.Context) (*model.Stats, error)
 }
 
 type Cache interface {
@@ -68,18 +74,41 @@ func New(repo Repository, cache Cache, videos VideoClient, users AuthClient) *Se
 	return &Service{repo: repo, cache: cache, videos: videos, users: users}
 }
 
+// Actor — кто выполняет действие. Администратор может менять любые комментарии.
+type Actor struct {
+	UserID  int64
+	IsAdmin bool
+}
+
 // ---------- Комментарии ----------
 
-func (s *Service) AddComment(ctx context.Context, videoID, userID int64, username, text string) (*model.Comment, error) {
-	text = strings.TrimSpace(text)
-	if n := utf8.RuneCountInString(text); n == 0 || n > 1000 {
-		return nil, &ValidationError{"comment must be 1-1000 characters long"}
-	}
-	if err := s.ensureVideoExists(ctx, videoID); err != nil {
+// AddComment добавляет комментарий или ответ (если parentID не nil).
+// Ответы одноуровневые, как на YouTube: ответ на ответ привязывается к корневому комментарию.
+func (s *Service) AddComment(ctx context.Context, videoID, userID int64, username, text string, parentID *int64) (*model.Comment, error) {
+	text, err := validateText(text)
+	if err != nil {
 		return nil, err
 	}
 
-	c := &model.Comment{VideoID: videoID, UserID: userID, Username: username, Text: text}
+	if parentID != nil {
+		parent, err := s.repo.GetComment(ctx, *parentID)
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, ErrCommentNotFound
+		}
+		if err != nil {
+			return nil, err
+		}
+		if parent.VideoID != videoID {
+			return nil, &ValidationError{"parent comment belongs to another video"}
+		}
+		if parent.ParentID != nil {
+			parentID = parent.ParentID
+		}
+	} else if err := s.ensureVideoExists(ctx, videoID); err != nil {
+		return nil, err
+	}
+
+	c := &model.Comment{VideoID: videoID, UserID: userID, Username: username, Text: text, ParentID: parentID}
 	if err := s.repo.CreateComment(ctx, c); err != nil {
 		return nil, fmt.Errorf("create comment: %w", err)
 	}
@@ -94,21 +123,65 @@ func (s *Service) ListComments(ctx context.Context, videoID int64, page, limit i
 	return &model.CommentPage{Items: items, Total: total, Page: page, Limit: limit}, nil
 }
 
-func (s *Service) DeleteComment(ctx context.Context, commentID, userID int64) error {
-	c, err := s.repo.GetComment(ctx, commentID)
-	if errors.Is(err, repository.ErrNotFound) {
-		return ErrCommentNotFound
+func (s *Service) ListReplies(ctx context.Context, commentID int64) ([]model.Comment, error) {
+	return s.repo.ListReplies(ctx, commentID)
+}
+
+func (s *Service) EditComment(ctx context.Context, actor Actor, commentID int64, text string) (*model.Comment, error) {
+	if _, err := s.editableComment(ctx, actor, commentID); err != nil {
+		return nil, err
 	}
+	text, err := validateText(text)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if c.UserID != userID {
-		return ErrForbidden
+	if err := s.repo.UpdateComment(ctx, commentID, text); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, ErrCommentNotFound
+		}
+		return nil, err
+	}
+	return s.repo.GetComment(ctx, commentID)
+}
+
+func (s *Service) DeleteComment(ctx context.Context, actor Actor, commentID int64) error {
+	if _, err := s.editableComment(ctx, actor, commentID); err != nil {
+		return err
 	}
 	if err := s.repo.DeleteComment(ctx, commentID); err != nil && !errors.Is(err, repository.ErrNotFound) {
 		return err
 	}
 	return nil
+}
+
+func (s *Service) AdminComments(ctx context.Context, search string, page, limit int) (*model.CommentPage, error) {
+	items, total, err := s.repo.AdminListComments(ctx, strings.TrimSpace(search), limit, (page-1)*limit)
+	if err != nil {
+		return nil, err
+	}
+	return &model.CommentPage{Items: items, Total: total, Page: page, Limit: limit}, nil
+}
+
+func (s *Service) editableComment(ctx context.Context, actor Actor, commentID int64) (*model.Comment, error) {
+	c, err := s.repo.GetComment(ctx, commentID)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, ErrCommentNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !actor.IsAdmin && c.UserID != actor.UserID {
+		return nil, ErrForbidden
+	}
+	return c, nil
+}
+
+func validateText(text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if n := utf8.RuneCountInString(text); n == 0 || n > 1000 {
+		return "", &ValidationError{"comment must be 1-1000 characters long"}
+	}
+	return text, nil
 }
 
 // ---------- Реакции ----------
@@ -173,7 +246,8 @@ func (s *Service) Stats(ctx context.Context, videoID, userID int64) (*model.Reac
 
 // ---------- Подписки ----------
 
-func (s *Service) Subscribe(ctx context.Context, userID, channelID int64) error {
+// Subscribe подписывает на канал. Канал — это пользователь; видео у него может ещё не быть.
+func (s *Service) Subscribe(ctx context.Context, userID int64, username string, channelID int64) error {
 	if userID == channelID {
 		return &ValidationError{"you cannot subscribe to yourself"}
 	}
@@ -184,7 +258,7 @@ func (s *Service) Subscribe(ctx context.Context, userID, channelID int64) error 
 	if !found {
 		return ErrChannelNotFound
 	}
-	return s.repo.Subscribe(ctx, userID, channelID, name)
+	return s.repo.Subscribe(ctx, userID, username, channelID, name)
 }
 
 func (s *Service) Unsubscribe(ctx context.Context, userID, channelID int64) error {
@@ -199,9 +273,15 @@ func (s *Service) Subscriptions(ctx context.Context, userID int64) ([]model.Subs
 	return s.repo.ListSubscriptions(ctx, userID)
 }
 
+func (s *Service) Subscribers(ctx context.Context, channelID int64) ([]model.Subscriber, error) {
+	return s.repo.ListSubscribers(ctx, channelID)
+}
+
 func (s *Service) SubscribersCount(ctx context.Context, channelID int64) (int64, error) {
 	return s.repo.CountSubscribers(ctx, channelID)
 }
+
+// ---------- Удаление и статистика ----------
 
 // DeleteVideoData вызывается video-service при удалении видео.
 func (s *Service) DeleteVideoData(ctx context.Context, videoID int64) error {
@@ -210,6 +290,22 @@ func (s *Service) DeleteVideoData(ctx context.Context, videoID int64) error {
 	}
 	_ = s.cache.Invalidate(ctx, videoID)
 	return nil
+}
+
+// DeleteUserData вызывается auth-service при удалении аккаунта.
+func (s *Service) DeleteUserData(ctx context.Context, userID int64) error {
+	videoIDs, err := s.repo.DeleteUserData(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, id := range videoIDs {
+		_ = s.cache.Invalidate(ctx, id)
+	}
+	return nil
+}
+
+func (s *Service) AdminStats(ctx context.Context) (*model.Stats, error) {
+	return s.repo.Stats(ctx)
 }
 
 func (s *Service) ensureVideoExists(ctx context.Context, videoID int64) error {

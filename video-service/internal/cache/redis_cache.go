@@ -48,6 +48,7 @@ func (c *Cache) GetVideo(ctx context.Context, id int64) (*model.Video, error) {
 		return nil, err
 	}
 	cv.Video.FileName = cv.FileName
+	cv.Video.ThumbnailFile = cv.ThumbnailFile
 	return &cv.Video, nil
 }
 
@@ -55,11 +56,12 @@ func (c *Cache) GetVideo(ctx context.Context, id int64) (*model.Video, error) {
 // а в кеше его нужно хранить, чтобы стриминг работал без обращения к БД.
 type cachedVideo struct {
 	model.Video
-	FileName string `json:"file_name"`
+	FileName      string `json:"file_name"`
+	ThumbnailFile string `json:"thumbnail_file"`
 }
 
 func (c *Cache) SetVideo(ctx context.Context, v *model.Video) error {
-	data, err := json.Marshal(cachedVideo{Video: *v, FileName: v.FileName})
+	data, err := json.Marshal(cachedVideo{Video: *v, FileName: v.FileName, ThumbnailFile: v.ThumbnailFile})
 	if err != nil {
 		return err
 	}

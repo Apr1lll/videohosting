@@ -96,15 +96,25 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// эти заголовки выставляет только gateway после проверки токена.
 	r.Header.Del("X-User-ID")
 	r.Header.Del("X-Username")
+	r.Header.Del("X-User-Role")
 
+	isAdmin := false
 	if header := r.Header.Get("Authorization"); header != "" {
-		userID, username, err := g.verifier.Verify(header)
+		id, err := g.verifier.Verify(header)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, err.Error())
 			return
 		}
-		r.Header.Set("X-User-ID", strconv.FormatInt(userID, 10))
-		r.Header.Set("X-Username", username)
+		r.Header.Set("X-User-ID", strconv.FormatInt(id.UserID, 10))
+		r.Header.Set("X-Username", id.Username)
+		r.Header.Set("X-User-Role", id.Role)
+		isAdmin = id.Role == "admin"
+	}
+
+	// Админ-панель: пускаем только администраторов. Сервисы проверяют роль ещё раз.
+	if strings.HasPrefix(r.URL.Path, "/admin/") && !isAdmin {
+		writeError(w, http.StatusForbidden, "admin rights required")
+		return
 	}
 
 	b := g.route(r.URL.Path)
@@ -125,7 +135,13 @@ func (g *Gateway) route(path string) *backend {
 	switch {
 	case strings.HasPrefix(path, "/auth/"):
 		return g.auth
-	case path == "/users/me/subscriptions":
+	case path == "/users/me/subscriptions", path == "/users/me/subscribers":
+		return g.interaction
+	case strings.HasPrefix(path, "/admin/users"):
+		return g.auth
+	case strings.HasPrefix(path, "/admin/videos"):
+		return g.video
+	case strings.HasPrefix(path, "/admin/comments"), strings.HasPrefix(path, "/admin/interactions"):
 		return g.interaction
 	case strings.HasPrefix(path, "/users/"):
 		return g.auth
